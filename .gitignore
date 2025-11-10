@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+.DS_Store
+
+# Output
+output/*.png
+!output/.gitkeep
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled Metal
+*.air
+*.metallib
+
+# Logs
+*.log
+pdfs/*.pdf
+pdfs/
