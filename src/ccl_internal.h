@@ -57,3 +57,8 @@ struct ccl_indirect_command_buffer {
     void *impl;
 };
 
+struct ccl_gpu_dynamic_library {
+    ccl_backend_kind kind;
+    void *impl;
+};
+

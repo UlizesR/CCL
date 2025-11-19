@@ -1,6 +1,6 @@
 # CCL - Cross-Platform Compute Library
 
-CCL is a clean, portable C API for GPU compute that abstracts over multiple backends (Metal, OpenGL Compute, OpenCL). Currently, the Metal backend is fully implemented with comprehensive Metal 3/4 feature support.
+CCL is a clean, portable C API for GPU compute that abstracts over multiple backends (Metal, OpenGL Compute, OpenCL). Currently, the Metal backend is fully implemented with Metal 3/4 feature support. Note: Some advanced features (function tables, ray tracing) require Metal 3+ hardware and may have limitations (see feature documentation below).
 
 ## Features
 
@@ -14,13 +14,14 @@ CCL is a clean, portable C API for GPU compute that abstracts over multiple back
 - **Thread-safe fences**: Query completion status without blocking
 
 ### Metal 3/4 Features
-- **Capability detection**: Runtime detection of Metal 3/4 features and GPU families
-- **Function tables**: GPU-side function pointer dispatch for dynamic kernel selection
-- **Binary archives**: Pipeline caching to disk for faster startup times
+- **Capability detection**: Runtime detection of Metal 3/4 features and GPU families with proper feature probing
+- **Function tables**: GPU-side function pointer dispatch for dynamic kernel selection (Metal 3+)
+- **Binary archives**: Pipeline caching to disk for faster startup times (Metal 3+)
 - **Ray tracing**: Acceleration structures and ray tracing pipelines (Metal 3+)
-- **Indirect command buffers**: GPU-driven command generation for reduced CPU overhead
-- **SIMD-group matrix operations**: Optimized matrix operations on Apple7+ GPUs
+- **Indirect command buffers**: GPU-driven command generation for reduced CPU overhead (Metal 3+)
+- **SIMD-group matrix operations**: Optimized matrix operations on Apple7+ GPUs (Metal 3+)
 - **Argument buffers**: Enhanced resource binding with expanded limits (Metal 3/4)
+- **GPU Dynamic Libraries**: Runtime library linking on the GPU for modular shader code (Metal 4+)
 
 ## Quick Start
 
@@ -102,7 +103,7 @@ ccl_error ccl_buffer_download(ccl_buffer *buf, size_t offset, void *data, size_t
 - `CCL_BUFFER_USAGE_CPU_TO_GPU`: Optimized for CPU→GPU transfers
 - `CCL_BUFFER_USAGE_GPU_TO_CPU`: Optimized for GPU→CPU transfers
 
-**Note**: GPU_ONLY buffers currently don't support `ccl_buffer_upload`/`ccl_buffer_download` after creation. Use initial data at creation time.
+**Note**: GPU_ONLY buffers require the extended upload/download APIs (`ccl_buffer_upload_ex`/`ccl_buffer_download_ex`) which take a context parameter for blit-based transfers. The standard `ccl_buffer_upload`/`ccl_buffer_download` functions only work with shared buffers.
 
 ### Kernels
 
@@ -245,6 +246,9 @@ ccl_get_metal_capabilities(ctx, &caps);
 
 if (caps.supports_metal_4) {
     printf("Metal 4 supported!\n");
+    if (caps.supports_gpu_dynamic_libraries) {
+        printf("GPU Dynamic Libraries available\n");
+    }
 }
 if (caps.supports_function_tables) {
     printf("Function tables available (max size: %u)\n", caps.max_function_table_size);
@@ -255,6 +259,7 @@ if (caps.supports_raytracing) {
 if (caps.supports_simdgroup_matrix) {
     printf("SIMD-group matrix operations available\n");
 }
+printf("Max argument buffer size: %u bytes\n", caps.max_argument_buffer_length);
 ```
 
 ### Function Tables (Metal 3+)
@@ -262,11 +267,12 @@ if (caps.supports_simdgroup_matrix) {
 Function tables enable GPU-side function pointer dispatch:
 
 ```c
-// Create a function table
+// Create a function table (optionally with an initial kernel to establish the pipeline)
 ccl_function_table *table;
-ccl_create_function_table(ctx, 16, &table);  // 16 function slots
+ccl_create_function_table(ctx, 16, kernel1, &table);  // 16 function slots, use kernel1's pipeline
+// Or create lazily: ccl_create_function_table(ctx, 16, NULL, &table);
 
-// Add kernels to the table
+// Add kernels to the table (all kernels must be compatible with the table's pipeline)
 ccl_function_table_set(table, kernel1, 0);
 ccl_function_table_set(table, kernel2, 1);
 
@@ -275,6 +281,8 @@ ccl_function_table_set(table, kernel2, 1);
 
 ccl_destroy_function_table(table);
 ```
+
+**Note**: Function tables require kernels with preserved `MTLFunction` objects. Cached kernels may need to be recompiled to support function tables. All kernels added to a table must be compatible (typically from the same library).
 
 ### Binary Archives (Metal 3+)
 
@@ -362,6 +370,30 @@ See `examples/device_info_metal.c` for an example of querying device capabilitie
 
 See `shaders/simdgroup_matrix.metal` for example kernels demonstrating SIMD-group matrix operations (Metal 3+, Apple7+ GPUs).
 
+### GPU Dynamic Libraries (Metal 4+)
+
+GPU Dynamic Libraries enable runtime library linking on the GPU, allowing for modular shader code:
+
+```c
+// Create a GPU dynamic library from precompiled library data
+uint8_t *lib_data = ...;  // Precompiled Metal library
+size_t lib_size = ...;
+ccl_gpu_dynamic_library *dyn_lib;
+ccl_create_gpu_dynamic_library(ctx, lib_data, lib_size, &dyn_lib);
+
+// Create kernels from the dynamic library
+ccl_kernel *kernel;
+ccl_create_kernel_from_gpu_dynamic_library(ctx, dyn_lib, "my_function", &kernel, log, sizeof(log));
+
+// Use the kernel normally
+ccl_dispatch_1d(ctx, kernel, ...);
+
+ccl_destroy_kernel(kernel);
+ccl_destroy_gpu_dynamic_library(dyn_lib);
+```
+
+**Note**: GPU Dynamic Libraries require Metal 4 (macOS 13.0+ / iOS 16.0+) and Metal 4-capable hardware. Use `ccl_get_metal_capabilities` to check for `supports_gpu_dynamic_libraries` before using this feature.
+
 ## Building
 
 ```bash
@@ -398,6 +430,8 @@ All functions return `ccl_error`:
 8. **Leverage function tables** (Metal 3+) for dynamic kernel selection without CPU overhead
 9. **Use indirect command buffers** (Metal 3+) for GPU-driven pipelines with many similar dispatches
 10. **Check capabilities** - use `ccl_get_metal_capabilities` to gate Metal 3/4 features appropriately
+11. **Use GPU Dynamic Libraries** (Metal 4+) for modular shader code and runtime library linking
+12. **Verify Metal 4 support** - Metal 4 detection uses feature probing, so check `supports_metal_4` and `supports_gpu_dynamic_libraries` before using Metal 4-specific features
 
 ## Thread Safety
 

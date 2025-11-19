@@ -20,10 +20,19 @@ static uint64_t ccl_hash_string(const char *str, size_t len) {
 
 // --- Objective-C helper objects ---
 
+// Cache entry that stores both pipeline and function for function table support
+@interface CCLMetalPipelineCacheEntry : NSObject
+@property (nonatomic, strong) id<MTLComputePipelineState> pipeline;
+@property (nonatomic, strong) id<MTLFunction> function;  // Cached for function table support
+@end
+
+@implementation CCLMetalPipelineCacheEntry
+@end
+
 @interface CCLMetalContext : NSObject
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipelineCache;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, CCLMetalPipelineCacheEntry *> *pipelineCache;
 @property (nonatomic, strong) MTLCompileOptions *compileOptions;
 @property (nonatomic, strong) NSString *label;
 @property (nonatomic, assign) ccl_log_fn logCallback;
@@ -106,6 +115,7 @@ static uint64_t ccl_hash_string(const char *str, size_t len) {
 @property (nonatomic, strong) id<MTLVisibleFunctionTable> table;
 @property (nonatomic, strong) id<MTLComputePipelineState> pipeline;  // Pipeline that created this table
 @property (nonatomic, assign) uint32_t size;
+@property (nonatomic, assign) BOOL isLazy;  // True if table not yet created (waiting for first kernel)
 @end
 
 @implementation CCLMetalFunctionTable
@@ -153,16 +163,119 @@ static uint64_t ccl_hash_string(const char *str, size_t len) {
 @implementation CCLMetalIndirectCommandBuffer
 @end
 
-// --- Context ---
+// GPU Dynamic Library (Metal 4+)
+@interface CCLMetalGPUDynamicLibrary : NSObject
+@property (nonatomic, strong) id<MTLDynamicLibrary> dynamicLibrary;
+@property (nonatomic, strong) id<MTLLibrary> originalLibrary;  // Store original library for function access
+@end
+
+@implementation CCLMetalGPUDynamicLibrary
+@end
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Validate Metal context
+static inline ccl_error ccl_validate_metal_context(ccl_context *ctx) {
+    if (!ctx || ctx->kind != CCL_BACKEND_KIND_METAL) {
+        return CCL_ERROR_INVALID_ARGUMENT;
+    }
+    return CCL_OK;
+}
+
+// Get Metal context from CCL context
+static inline CCLMetalContext *ccl_get_metal_context(ccl_context *ctx) {
+    if (!ctx || ctx->kind != CCL_BACKEND_KIND_METAL) return nil;
+    return (__bridge CCLMetalContext *)ctx->impl;
+}
+
+// Check Metal 3 availability
+static inline BOOL ccl_metal3_available(void) {
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        return YES;
+    }
+    return NO;
+}
+
+// Check Metal 4 availability
+static inline BOOL ccl_metal4_available(void) {
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        return YES;
+    }
+    return NO;
+}
 
 // Helper to call log callback if set
 static void ccl_log_metal(ccl_context *ctx, const char *msg) {
     if (!ctx || ctx->kind != CCL_BACKEND_KIND_METAL) return;
-    CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
-    if (metalCtx.logCallback && msg) {
+    CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+    if (metalCtx && metalCtx.logCallback && msg) {
         metalCtx.logCallback(msg, metalCtx.logUserData);
     }
 }
+
+// Helper: Create a CCL kernel object from Metal kernel
+static ccl_error ccl_create_kernel_object(CCLMetalKernel *metalKernel, ccl_kernel **out_kernel) {
+    if (!metalKernel || !out_kernel) return CCL_ERROR_INVALID_ARGUMENT;
+    
+    ccl_kernel *kernel = (ccl_kernel *)malloc(sizeof(ccl_kernel));
+    if (!kernel) return CCL_ERROR_DEVICE_FAILED;
+    
+    kernel->kind = CCL_BACKEND_KIND_METAL;
+    kernel->impl = (__bridge_retained void *)metalKernel;
+    *out_kernel = kernel;
+    return CCL_OK;
+}
+
+// Helper to log Metal errors
+static void ccl_log_metal_error(ccl_context *ctx, const char *prefix, NSError *error, char *log_buffer, size_t log_buffer_size) {
+    const char *msg = error.localizedDescription.UTF8String;
+    const char *errorMsg = msg ? msg : "Unknown error";
+    
+    if (log_buffer && log_buffer_size > 0) {
+        snprintf(log_buffer, log_buffer_size, "%s", errorMsg);
+    }
+    
+    if (prefix) {
+        char callbackMsg[512];
+        snprintf(callbackMsg, sizeof(callbackMsg), "%s: %s", prefix, errorMsg);
+        ccl_log_metal(ctx, callbackMsg);
+    }
+}
+
+// Create a fence from a Metal command buffer
+static inline ccl_error ccl_create_fence_from_command_buffer(
+    id<MTLCommandBuffer> cmd,
+    ccl_fence **out_fence
+) {
+    if (!cmd) {
+        if (out_fence) *out_fence = NULL;
+        return CCL_OK;  // No fence needed
+    }
+    
+    if (!out_fence) return CCL_OK;
+    
+    CCLMetalFence *fence = [[CCLMetalFence alloc] initWithCommandBuffer:cmd];
+    if (!fence) {
+        *out_fence = NULL;
+        return CCL_ERROR_DEVICE_FAILED;
+    }
+    
+    ccl_fence *cclFence = (ccl_fence *)malloc(sizeof(ccl_fence));
+    if (!cclFence) {
+        *out_fence = NULL;
+        return CCL_ERROR_DEVICE_FAILED;
+    }
+    
+    cclFence->kind = CCL_BACKEND_KIND_METAL;
+    cclFence->impl = (__bridge_retained void *)fence;
+    *out_fence = cclFence;
+    
+    return CCL_OK;
+}
+
+// --- Context ---
 
 static ccl_error ccl_create_context_metal(ccl_context **out_ctx) {
     if (!out_ctx) return CCL_ERROR_INVALID_ARGUMENT;
@@ -231,10 +344,12 @@ void ccl_set_log_callback(ccl_context *ctx, ccl_log_fn fn, void *user_data) {
 // --- Command Buffer Batching ---
 
 static ccl_error ccl_begin_batch_metal(ccl_context *ctx) {
-    if (!ctx || ctx->kind != CCL_BACKEND_KIND_METAL) return CCL_ERROR_INVALID_ARGUMENT;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) return err;
     
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) return CCL_ERROR_INVALID_ARGUMENT;
         
         // Check if already in a batch
         if (metalCtx.activeBatch != nil) {
@@ -253,10 +368,18 @@ static ccl_error ccl_begin_batch_metal(ccl_context *ctx) {
 }
 
 static ccl_error ccl_end_batch_metal(ccl_context *ctx, ccl_fence **out_fence) {
-    if (!ctx || ctx->kind != CCL_BACKEND_KIND_METAL) return CCL_ERROR_INVALID_ARGUMENT;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) {
+        if (out_fence) *out_fence = NULL;
+        return err;
+    }
     
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) {
+            if (out_fence) *out_fence = NULL;
+            return CCL_ERROR_INVALID_ARGUMENT;
+        }
         
         // Check if not in a batch
         if (metalCtx.activeBatch == nil) {
@@ -269,31 +392,11 @@ static ccl_error ccl_end_batch_metal(ccl_context *ctx, ccl_fence **out_fence) {
         [metalCtx.activeBatch commit];
         
         // Create fence if requested
-        CCLMetalFence *fence = nil;
-        if (out_fence) {
-            fence = [[CCLMetalFence alloc] initWithCommandBuffer:metalCtx.activeBatch];
-        }
-        
-        // Clear batch state
         id<MTLCommandBuffer> cmd = metalCtx.activeBatch;
         metalCtx.activeBatch = nil;
         metalCtx.activeEncoder = nil;
         
-        // Return fence if requested
-        if (out_fence && fence) {
-            ccl_fence *cclFence = (ccl_fence *)malloc(sizeof(ccl_fence));
-            if (!cclFence) {
-                if (out_fence) {
-                    *out_fence = NULL;
-                }
-                return CCL_ERROR_DEVICE_FAILED;
-            }
-            cclFence->kind = CCL_BACKEND_KIND_METAL;
-            cclFence->impl = (__bridge_retained void *)fence;
-            *out_fence = cclFence;
-        }
-        
-        return CCL_OK;
+        return ccl_create_fence_from_command_buffer(cmd, out_fence);
     }
 }
 
@@ -328,10 +431,12 @@ static ccl_error ccl_get_device_info_metal(
     size_t *out_size
 ) {
     if (!ctx || !out_size) return CCL_ERROR_INVALID_ARGUMENT;
-    if (ctx->kind != CCL_BACKEND_KIND_METAL) return CCL_ERROR_INVALID_ARGUMENT;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) return err;
     
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) return CCL_ERROR_INVALID_ARGUMENT;
         id<MTLDevice> device = metalCtx.device;
         
         switch (info) {
@@ -614,11 +719,10 @@ ccl_error ccl_buffer_upload(
         if (buf->kind == CCL_BACKEND_KIND_METAL) {
             CCLMetalBuffer *metalBuf = (__bridge CCLMetalBuffer *)buf->impl;
             
-            // For GPU_ONLY buffers, uploads require a blit command
-            // For now, we only support direct uploads to shared buffers
-            // TODO: Add ccl_buffer_upload_ex that takes context for GPU_ONLY blits
+            // For GPU_ONLY buffers, uploads require a context for blit commands
+            // Return error indicating the extended API must be used
             if (metalBuf.usage == CCL_BUFFER_USAGE_GPU_ONLY) {
-                return CCL_ERROR_INVALID_ARGUMENT;  // GPU_ONLY uploads need context for blit
+                return CCL_ERROR_INVALID_ARGUMENT;  // GPU_ONLY uploads require ccl_buffer_upload_ex with context
             }
             
             // Shared buffers - direct memory access
@@ -777,12 +881,13 @@ ccl_error ccl_buffer_download(
         if (buf->kind == CCL_BACKEND_KIND_METAL) {
             CCLMetalBuffer *metalBuf = (__bridge CCLMetalBuffer *)buf->impl;
             
-            // GPU_ONLY buffers are not CPU-readable (contents is NULL)
-            // TODO: Add full blit-based transfer support for GPU_ONLY buffers
+            // GPU_ONLY buffers require a context for blit-based transfers
+            // Return error indicating the extended API must be used
             if (metalBuf.usage == CCL_BUFFER_USAGE_GPU_ONLY) {
-                return CCL_ERROR_INVALID_ARGUMENT;
+                return CCL_ERROR_INVALID_ARGUMENT;  // GPU_ONLY downloads require ccl_buffer_download_ex with context
             }
             
+            // Shared buffers - direct memory access
             uint8_t *src = (uint8_t *)metalBuf.buffer.contents + offset;
             memcpy(data, src, size);
             return CCL_OK;
@@ -804,11 +909,12 @@ static ccl_error ccl_create_kernel_from_source_metal(
 ) {
     if (!ctx || !source || !entry_point || !out_kernel)
         return CCL_ERROR_INVALID_ARGUMENT;
-    if (ctx->kind != CCL_BACKEND_KIND_METAL)
-        return CCL_ERROR_INVALID_ARGUMENT;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) return err;
 
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) return CCL_ERROR_INVALID_ARGUMENT;
 
         // Create cache key from source + entry point
         // Use hash of source for memory efficiency (especially for large shaders)
@@ -821,22 +927,13 @@ static ccl_error ccl_create_kernel_from_source_metal(
         // Check pipeline cache
         // NOTE: pipelineCache is not thread-safe. CCL contexts should be used
         // from a single thread, or add synchronization if multi-threaded access is needed.
-        id<MTLComputePipelineState> pipeline = metalCtx.pipelineCache[cacheKey];
-        if (pipeline) {
-            // Cache hit - reuse pipeline
+        CCLMetalPipelineCacheEntry *cacheEntry = metalCtx.pipelineCache[cacheKey];
+        if (cacheEntry) {
+            // Cache hit - reuse both pipeline and function
             CCLMetalKernel *metalKernel = [[CCLMetalKernel alloc] init];
-            metalKernel.pipeline = pipeline;
-            // Note: function not stored for cache hits (would need to recompile to get it)
-            // This is acceptable since function tables are typically used with new kernels
-
-            ccl_kernel *kernel = (ccl_kernel *)malloc(sizeof(ccl_kernel));
-            if (!kernel) return CCL_ERROR_DEVICE_FAILED;
-
-            kernel->kind = CCL_BACKEND_KIND_METAL;
-            kernel->impl = (__bridge_retained void *)metalKernel;
-
-            *out_kernel = kernel;
-            return CCL_OK;
+            metalKernel.pipeline = cacheEntry.pipeline;
+            metalKernel.function = cacheEntry.function;  // Function is now cached too
+            return ccl_create_kernel_object(metalKernel, out_kernel);
         }
 
         // Cache miss - compile
@@ -846,18 +943,7 @@ static ccl_error ccl_create_kernel_from_source_metal(
                                                            options:metalCtx.compileOptions
                                                              error:&error];
         if (!lib) {
-            const char *msg = error.localizedDescription.UTF8String;
-            const char *errorMsg = msg ? msg : "Metal compile error";
-            
-            if (log_buffer && log_buffer_size > 0) {
-                snprintf(log_buffer, log_buffer_size, "%s", errorMsg);
-            }
-            
-            // Also call log callback if set
-            char callbackMsg[512];
-            snprintf(callbackMsg, sizeof(callbackMsg), "Kernel compile failed: %s", errorMsg);
-            ccl_log_metal(ctx, callbackMsg);
-            
+            ccl_log_metal_error(ctx, "Kernel compile failed", error, log_buffer, log_buffer_size);
             return CCL_ERROR_COMPILE_FAILED;
         }
 
@@ -869,7 +955,7 @@ static ccl_error ccl_create_kernel_from_source_metal(
             return CCL_ERROR_COMPILE_FAILED;
         }
 
-        pipeline = [metalCtx.device newComputePipelineStateWithFunction:func error:&error];
+        id<MTLComputePipelineState> pipeline = [metalCtx.device newComputePipelineStateWithFunction:func error:&error];
         if (!pipeline) {
             if (log_buffer && log_buffer_size > 0) {
                 const char *msg = error.localizedDescription.UTF8String;
@@ -878,21 +964,16 @@ static ccl_error ccl_create_kernel_from_source_metal(
             return CCL_ERROR_COMPILE_FAILED;
         }
 
-        // Cache the pipeline
-        metalCtx.pipelineCache[cacheKey] = pipeline;
+        // Cache both pipeline and function for function table support
+        CCLMetalPipelineCacheEntry *newEntry = [[CCLMetalPipelineCacheEntry alloc] init];
+        newEntry.pipeline = pipeline;
+        newEntry.function = func;  // Cache function for function tables
+        metalCtx.pipelineCache[cacheKey] = newEntry;
 
         CCLMetalKernel *metalKernel = [[CCLMetalKernel alloc] init];
         metalKernel.pipeline = pipeline;
         metalKernel.function = func;  // Store function for function tables
-
-        ccl_kernel *kernel = (ccl_kernel *)malloc(sizeof(ccl_kernel));
-        if (!kernel) return CCL_ERROR_DEVICE_FAILED;
-
-        kernel->kind = CCL_BACKEND_KIND_METAL;
-        kernel->impl = (__bridge_retained void *)metalKernel;
-
-        *out_kernel = kernel;
-        return CCL_OK;
+        return ccl_create_kernel_object(metalKernel, out_kernel);
     }
 }
 
@@ -907,11 +988,12 @@ static ccl_error ccl_create_kernel_from_library_metal(
 ) {
     if (!ctx || !lib_data || !entry_point || !out_kernel || lib_size == 0)
         return CCL_ERROR_INVALID_ARGUMENT;
-    if (ctx->kind != CCL_BACKEND_KIND_METAL)
-        return CCL_ERROR_INVALID_ARGUMENT;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) return err;
 
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) return CCL_ERROR_INVALID_ARGUMENT;
 
         // Create library from precompiled data
         // Metal expects dispatch_data_t, so we create it from the raw bytes
@@ -1490,99 +1572,109 @@ void ccl_set_kernel_label(ccl_kernel *kernel, const char *label) {
 
 // --- Metal 3/4 Capability Detection ---
 
+// Helper: Detect Metal 4 support via GPU Dynamic Libraries
+static void ccl_detect_metal4_capabilities(id<MTLDevice> device, ccl_metal_capabilities *out_caps) {
+    if (!ccl_metal4_available()) return;
+    
+    // Metal 4 introduces GPU Dynamic Libraries - check if the API is available
+    if ([device respondsToSelector:@selector(newDynamicLibrary:error:)]) {
+        // Verify Metal 4 by checking if we can actually use the feature
+        NSError *testError = nil;
+        const char *testSource = "kernel void test() {}";
+        NSString *testSrc = [NSString stringWithUTF8String:testSource];
+        id<MTLLibrary> testLib = [device newLibraryWithSource:testSrc options:nil error:&testError];
+        if (testLib) {
+            // Try to create a dynamic library (Metal 4 feature)
+            id<MTLDynamicLibrary> testDynLib = [device newDynamicLibrary:testLib error:&testError];
+            if (testDynLib) {
+                // Successfully created dynamic library - we have Metal 4
+                out_caps->supports_metal_4 = true;
+                out_caps->supports_gpu_dynamic_libraries = true;
+                out_caps->max_argument_buffer_length = 128 * 1024;  // 128KB for Metal 4
+            }
+        }
+    }
+}
+
+// Helper: Detect SIMD-group matrix support across Apple GPU families
+static void ccl_detect_simdgroup_matrix(id<MTLDevice> device, ccl_metal_capabilities *out_caps) {
+    // Check Apple7+ families for SIMD-group matrix support
+    if ([device supportsFamily:MTLGPUFamilyApple7]) {
+        out_caps->supports_simdgroup_matrix = true;
+    }
+    
+    if (@available(macOS 12.0, iOS 15.0, *)) {
+        if ([device supportsFamily:MTLGPUFamilyApple8]) {
+            out_caps->supports_simdgroup_matrix = true;
+        }
+    }
+    
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        if ([device supportsFamily:MTLGPUFamilyApple9]) {
+            out_caps->supports_simdgroup_matrix = true;
+        }
+    }
+}
+
+// Helper: Set argument buffer capabilities
+static void ccl_set_argument_buffer_capabilities(id<MTLDevice> device, ccl_metal_capabilities *out_caps) {
+    // Argument buffers are available on all Metal devices, enhanced in Metal 3/4
+    if (out_caps->supports_metal_3 || [device supportsFamily:MTLGPUFamilyApple1]) {
+        out_caps->supports_argument_buffers = true;
+        // Set limits based on Metal version
+        if (out_caps->supports_metal_4) {
+            out_caps->max_argument_buffer_length = 128 * 1024;  // 128KB+ for Metal 4
+        } else if (out_caps->supports_metal_3) {
+            out_caps->max_argument_buffer_length = 128 * 1024;  // 128KB for Metal 3
+        } else {
+            out_caps->max_argument_buffer_length = 64 * 1024;   // 64KB for older Metal
+        }
+    }
+}
+
 static ccl_error ccl_get_metal_capabilities_metal(
     ccl_context *ctx,
     ccl_metal_capabilities *out_caps
 ) {
     if (!ctx || !out_caps) return CCL_ERROR_INVALID_ARGUMENT;
-    if (ctx->kind != CCL_BACKEND_KIND_METAL) return CCL_ERROR_NOT_SUPPORTED;
+    ccl_error err = ccl_validate_metal_context(ctx);
+    if (err != CCL_OK) return CCL_ERROR_NOT_SUPPORTED;
     
     @autoreleasepool {
-        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalContext *metalCtx = ccl_get_metal_context(ctx);
+        if (!metalCtx) return CCL_ERROR_INVALID_ARGUMENT;
         id<MTLDevice> device = metalCtx.device;
         
         // Initialize all to false
         memset(out_caps, 0, sizeof(ccl_metal_capabilities));
         
         // Check Metal 3 support (macOS 11.0+, iOS 14.0+)
-        if (@available(macOS 11.0, iOS 14.0, *)) {
-            // Check for Metal 3 GPU families
-            if ([device supportsFamily:MTLGPUFamilyMetal3]) {
-                out_caps->supports_metal_3 = true;
-            }
-            
-            // Check for Metal 4 support (macOS 13.0+, iOS 16.0+)
-            // Metal 4 doesn't have a separate GPU family enum, but we can detect it via other means
-            if (@available(macOS 13.0, iOS 16.0, *)) {
-                // Metal 4 is available on newer devices - check for enhanced features
-                // For now, we'll set this based on Metal 3 support and newer OS versions
-                // In practice, you'd check for specific Metal 4 features
-                if (out_caps->supports_metal_3) {
-                    // Metal 4 is typically available on devices that support Metal 3 with newer OS
-                    // This is a simplified check - full detection would query specific Metal 4 features
-                    out_caps->supports_metal_4 = true;
-                }
-            }
-            
-            // Function tables (Metal 3+)
-            if (out_caps->supports_metal_3) {
-                out_caps->supports_function_tables = true;
-                // Max function table size is typically 64K entries
-                out_caps->max_function_table_size = 65536;
-            }
-            
-            // Ray tracing (Metal 3+)
-            if ([device supportsRaytracing]) {
-                out_caps->supports_raytracing = true;
-            }
-            
-            // Binary archives (Metal 3+)
-            if ([device supportsFamily:MTLGPUFamilyMetal3]) {
-                out_caps->supports_binary_archives = true;
-            }
-            
-            // SIMD-group matrix (Apple7+ family, Metal 3+)
-            if ([device supportsFamily:MTLGPUFamilyApple7]) {
-                out_caps->supports_simdgroup_matrix = true;
-            }
-            // Also check Apple8, Apple9, Apple10 families
-            if (@available(macOS 12.0, iOS 15.0, *)) {
-                if ([device supportsFamily:MTLGPUFamilyApple8]) {
-                    out_caps->supports_simdgroup_matrix = true;
-                }
-            }
-            if (@available(macOS 13.0, iOS 16.0, *)) {
-                if ([device supportsFamily:MTLGPUFamilyApple9]) {
-                    out_caps->supports_simdgroup_matrix = true;
-                }
-            }
-            // Check for newer Apple GPU families as they become available
-            // Apple10 family may not be in all SDKs yet
-            if (@available(macOS 14.0, iOS 17.0, *)) {
-                // Check if Apple10 family exists (may not be in older SDKs)
-                if ([device respondsToSelector:@selector(supportsFamily:)]) {
-                    // Try to detect newer families - this will compile even if enum doesn't exist
-                    // Runtime check will handle availability
-                }
-            }
-            
-            // Indirect command buffers (Metal 3+)
-            if (out_caps->supports_metal_3) {
-                out_caps->supports_indirect_command_buffers = true;
-            }
-            
-            // Argument buffers (available on all Metal devices, enhanced in Metal 3/4)
-            // Metal 2+ devices support argument buffers
-            if (out_caps->supports_metal_3 || [device supportsFamily:MTLGPUFamilyApple1]) {
-                out_caps->supports_argument_buffers = true;
-                // Metal 3+ has expanded limits
-                if (out_caps->supports_metal_3) {
-                    out_caps->max_argument_buffer_length = 128 * 1024;  // 128KB for Metal 3+
-                } else {
-                    out_caps->max_argument_buffer_length = 64 * 1024;   // 64KB for older Metal
-                }
-            }
+        if (!ccl_metal3_available()) {
+            return CCL_OK;  // No Metal 3+ features available
         }
+        
+        // Check for Metal 3 GPU families
+        if ([device supportsFamily:MTLGPUFamilyMetal3]) {
+            out_caps->supports_metal_3 = true;
+            out_caps->supports_function_tables = true;
+            out_caps->supports_binary_archives = true;
+            out_caps->supports_indirect_command_buffers = true;
+            out_caps->max_function_table_size = 65536;  // 64K entries
+        }
+        
+        // Check for Metal 4 support
+        ccl_detect_metal4_capabilities(device, out_caps);
+        
+        // Ray tracing (Metal 3+)
+        if ([device supportsRaytracing]) {
+            out_caps->supports_raytracing = true;
+        }
+        
+        // SIMD-group matrix support
+        ccl_detect_simdgroup_matrix(device, out_caps);
+        
+        // Argument buffers
+        ccl_set_argument_buffer_capabilities(device, out_caps);
         
         return CCL_OK;
     }
@@ -1607,6 +1699,7 @@ ccl_error ccl_get_metal_capabilities(
 static ccl_error ccl_create_function_table_metal(
     ccl_context *ctx,
     uint32_t size,
+    ccl_kernel *initial_kernel,
     ccl_function_table **out_table
 ) {
     if (!ctx || !out_table || size == 0) return CCL_ERROR_INVALID_ARGUMENT;
@@ -1625,42 +1718,35 @@ static ccl_error ccl_create_function_table_metal(
             return CCL_ERROR_NOT_SUPPORTED;
         }
         
-        // Create a minimal compute function for the pipeline
-        // We need a pipeline state to create visible function tables
-        const char *dummySource = "kernel void dummy_function() {}";
-        NSString *src = [NSString stringWithUTF8String:dummySource];
-        NSError *error = nil;
-        id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&error];
-        if (!lib) {
-            return CCL_ERROR_DEVICE_FAILED;
-        }
-        
-        id<MTLFunction> dummyFunc = [lib newFunctionWithName:@"dummy_function"];
-        if (!dummyFunc) {
-            return CCL_ERROR_DEVICE_FAILED;
-        }
-        
-        MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
-        desc.computeFunction = dummyFunc;
-        
-        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:dummyFunc error:&error];
-        if (!pipeline) {
-            return CCL_ERROR_DEVICE_FAILED;
-        }
-        
-        // Create visible function table descriptor
-        MTLVisibleFunctionTableDescriptor *tableDesc = [[MTLVisibleFunctionTableDescriptor alloc] init];
-        tableDesc.functionCount = size;
-        
-        id<MTLVisibleFunctionTable> table = [pipeline newVisibleFunctionTableWithDescriptor:tableDesc];
-        if (!table) {
-            return CCL_ERROR_DEVICE_FAILED;
-        }
-        
         CCLMetalFunctionTable *metalTable = [[CCLMetalFunctionTable alloc] init];
-        metalTable.table = table;
-        metalTable.pipeline = pipeline;
         metalTable.size = size;
+        metalTable.isLazy = (initial_kernel == NULL);
+        
+        // If initial_kernel is provided, create the table immediately using its pipeline
+        if (initial_kernel) {
+            if (initial_kernel->kind != CCL_BACKEND_KIND_METAL) {
+                return CCL_ERROR_INVALID_ARGUMENT;
+            }
+            
+            CCLMetalKernel *metalKernel = (__bridge CCLMetalKernel *)initial_kernel->impl;
+            if (!metalKernel.pipeline) {
+                return CCL_ERROR_INVALID_ARGUMENT;
+            }
+            
+            // Create visible function table descriptor
+            MTLVisibleFunctionTableDescriptor *tableDesc = [[MTLVisibleFunctionTableDescriptor alloc] init];
+            tableDesc.functionCount = size;
+            
+            id<MTLVisibleFunctionTable> table = [metalKernel.pipeline newVisibleFunctionTableWithDescriptor:tableDesc];
+            if (!table) {
+                return CCL_ERROR_DEVICE_FAILED;
+            }
+            
+            metalTable.table = table;
+            metalTable.pipeline = metalKernel.pipeline;
+            metalTable.isLazy = NO;
+        }
+        // Otherwise, table will be created lazily when first function is set
         
         ccl_function_table *cclTable = (ccl_function_table *)malloc(sizeof(ccl_function_table));
         if (!cclTable) return CCL_ERROR_DEVICE_FAILED;
@@ -1676,13 +1762,14 @@ static ccl_error ccl_create_function_table_metal(
 ccl_error ccl_create_function_table(
     ccl_context *ctx,
     uint32_t size,
+    ccl_kernel *initial_kernel,
     ccl_function_table **out_table
 ) {
     if (!ctx) return CCL_ERROR_INVALID_ARGUMENT;
     
     switch (ctx->kind) {
     case CCL_BACKEND_KIND_METAL:
-        return ccl_create_function_table_metal(ctx, size, out_table);
+        return ccl_create_function_table_metal(ctx, size, initial_kernel, out_table);
     default:
         return CCL_ERROR_NOT_SUPPORTED;
     }
@@ -1707,18 +1794,44 @@ static ccl_error ccl_function_table_set_metal(
         
         // Check Metal 3 support
         if (@available(macOS 11.0, iOS 14.0, *)) {
+            // If table is lazy (not yet created), create it now using this kernel's pipeline
+            if (metalTable.isLazy) {
+                if (!metalKernel.pipeline) {
+                    return CCL_ERROR_INVALID_ARGUMENT;
+                }
+                
+                // Create visible function table descriptor
+                MTLVisibleFunctionTableDescriptor *tableDesc = [[MTLVisibleFunctionTableDescriptor alloc] init];
+                tableDesc.functionCount = metalTable.size;
+                
+                id<MTLVisibleFunctionTable> newTable = [metalKernel.pipeline newVisibleFunctionTableWithDescriptor:tableDesc];
+                if (!newTable) {
+                    return CCL_ERROR_DEVICE_FAILED;
+                }
+                
+                metalTable.table = newTable;
+                metalTable.pipeline = metalKernel.pipeline;
+                metalTable.isLazy = NO;
+            }
+            
+            // Verify the kernel's pipeline matches the table's pipeline
+            // (They should be compatible - ideally the same pipeline or from the same library)
+            if (metalKernel.pipeline != metalTable.pipeline) {
+                // Check if they're compatible (from same library)
+                // For now, we require them to be the same pipeline for safety
+                // In practice, Metal allows function handles from compatible pipelines
+                // but we'll be conservative here
+                return CCL_ERROR_INVALID_ARGUMENT;
+            }
+            
             // Get function handle from the kernel's pipeline
-            // Note: We need the function from the kernel to create a handle
-            // The function must be from the same library/device
             if (!metalKernel.function) {
                 // Function not available (e.g., from cache hit)
-                // For cached kernels, we can't create function handles
-                // Users should create kernels without caching for function tables
+                // This is the cached kernel issue - we need to preserve the function
                 return CCL_ERROR_INVALID_ARGUMENT;
             }
             
             // Create function handle from the pipeline state
-            // The pipeline must support function handles (Metal 3+)
             id<MTLFunctionHandle> handle = [metalTable.pipeline functionHandleWithFunction:metalKernel.function];
             if (!handle) {
                 return CCL_ERROR_DEVICE_FAILED;
@@ -2421,5 +2534,158 @@ void ccl_destroy_indirect_command_buffer(ccl_indirect_command_buffer *icb) {
         CFRelease(icb->impl);
     }
     free(icb);
+}
+
+// --- GPU Dynamic Libraries (Metal 4+) ---
+
+static ccl_error ccl_create_gpu_dynamic_library_metal(
+    ccl_context *ctx,
+    const uint8_t *lib_data,
+    size_t lib_size,
+    ccl_gpu_dynamic_library **out_lib
+) {
+    if (!ctx || !lib_data || !out_lib || lib_size == 0) return CCL_ERROR_INVALID_ARGUMENT;
+    if (ctx->kind != CCL_BACKEND_KIND_METAL) return CCL_ERROR_NOT_SUPPORTED;
+    
+    @autoreleasepool {
+        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        id<MTLDevice> device = metalCtx.device;
+        
+        // Check Metal 4 support
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            if (![device respondsToSelector:@selector(newDynamicLibrary:error:)]) {
+                return CCL_ERROR_NOT_SUPPORTED;
+            }
+        } else {
+            return CCL_ERROR_NOT_SUPPORTED;
+        }
+        
+        // Create library from precompiled data
+        dispatch_data_t libData = dispatch_data_create(lib_data, lib_size, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        NSError *error = nil;
+        id<MTLLibrary> lib = [device newLibraryWithData:libData error:&error];
+        if (!lib) {
+            return CCL_ERROR_COMPILE_FAILED;
+        }
+        
+        // Create GPU dynamic library (Metal 4 feature)
+        id<MTLDynamicLibrary> dynLib = [device newDynamicLibrary:lib error:&error];
+        if (!dynLib) {
+            return CCL_ERROR_DEVICE_FAILED;
+        }
+        
+        CCLMetalGPUDynamicLibrary *metalDynLib = [[CCLMetalGPUDynamicLibrary alloc] init];
+        metalDynLib.dynamicLibrary = dynLib;
+        metalDynLib.originalLibrary = lib;  // Store original library for function access
+        
+        ccl_gpu_dynamic_library *cclDynLib = (ccl_gpu_dynamic_library *)malloc(sizeof(ccl_gpu_dynamic_library));
+        if (!cclDynLib) return CCL_ERROR_DEVICE_FAILED;
+        
+        cclDynLib->kind = CCL_BACKEND_KIND_METAL;
+        cclDynLib->impl = (__bridge_retained void *)metalDynLib;
+        
+        *out_lib = cclDynLib;
+        return CCL_OK;
+    }
+}
+
+ccl_error ccl_create_gpu_dynamic_library(
+    ccl_context *ctx,
+    const uint8_t *lib_data,
+    size_t lib_size,
+    ccl_gpu_dynamic_library **out_lib
+) {
+    if (!ctx) return CCL_ERROR_INVALID_ARGUMENT;
+    
+    switch (ctx->kind) {
+    case CCL_BACKEND_KIND_METAL:
+        return ccl_create_gpu_dynamic_library_metal(ctx, lib_data, lib_size, out_lib);
+    default:
+        return CCL_ERROR_NOT_SUPPORTED;
+    }
+}
+
+static ccl_error ccl_create_kernel_from_gpu_dynamic_library_metal(
+    ccl_context *ctx,
+    ccl_gpu_dynamic_library *dyn_lib,
+    const char *entry_point,
+    ccl_kernel **out_kernel,
+    char *log_buffer,
+    size_t log_buffer_size
+) {
+    if (!ctx || !dyn_lib || !entry_point || !out_kernel)
+        return CCL_ERROR_INVALID_ARGUMENT;
+    if (ctx->kind != CCL_BACKEND_KIND_METAL || dyn_lib->kind != CCL_BACKEND_KIND_METAL)
+        return CCL_ERROR_INVALID_ARGUMENT;
+    
+    @autoreleasepool {
+        CCLMetalContext *metalCtx = (__bridge CCLMetalContext *)ctx->impl;
+        CCLMetalGPUDynamicLibrary *metalDynLib = (__bridge CCLMetalGPUDynamicLibrary *)dyn_lib->impl;
+        
+        // Check Metal 4 support
+        if (@available(macOS 13.0, iOS 16.0, *)) {
+            // Get function from the original library
+            NSString *entry = [NSString stringWithUTF8String:entry_point];
+            id<MTLFunction> func = [metalDynLib.originalLibrary newFunctionWithName:entry];
+            if (!func) {
+                if (log_buffer && log_buffer_size > 0) {
+                    snprintf(log_buffer, log_buffer_size, "Entry point not found: %s", entry_point);
+                }
+                return CCL_ERROR_COMPILE_FAILED;
+            }
+            
+            // Create compute pipeline from function
+            NSError *error = nil;
+            id<MTLComputePipelineState> pipeline = [metalCtx.device newComputePipelineStateWithFunction:func error:&error];
+            if (!pipeline) {
+                const char *msg = error.localizedDescription.UTF8String;
+                if (log_buffer && log_buffer_size > 0) {
+                    snprintf(log_buffer, log_buffer_size, "%s", msg ? msg : "Pipeline creation error");
+                }
+                return CCL_ERROR_COMPILE_FAILED;
+            }
+            
+            CCLMetalKernel *metalKernel = [[CCLMetalKernel alloc] init];
+            metalKernel.pipeline = pipeline;
+            metalKernel.function = func;
+            
+            ccl_kernel *kernel = (ccl_kernel *)malloc(sizeof(ccl_kernel));
+            if (!kernel) return CCL_ERROR_DEVICE_FAILED;
+            
+            kernel->kind = CCL_BACKEND_KIND_METAL;
+            kernel->impl = (__bridge_retained void *)metalKernel;
+            
+            *out_kernel = kernel;
+            return CCL_OK;
+        }
+        
+        return CCL_ERROR_NOT_SUPPORTED;
+    }
+}
+
+ccl_error ccl_create_kernel_from_gpu_dynamic_library(
+    ccl_context *ctx,
+    ccl_gpu_dynamic_library *dyn_lib,
+    const char *entry_point,
+    ccl_kernel **out_kernel,
+    char *log_buffer,
+    size_t log_buffer_size
+) {
+    if (!ctx) return CCL_ERROR_INVALID_ARGUMENT;
+    
+    switch (ctx->kind) {
+    case CCL_BACKEND_KIND_METAL:
+        return ccl_create_kernel_from_gpu_dynamic_library_metal(ctx, dyn_lib, entry_point, out_kernel, log_buffer, log_buffer_size);
+    default:
+        return CCL_ERROR_NOT_SUPPORTED;
+    }
+}
+
+void ccl_destroy_gpu_dynamic_library(ccl_gpu_dynamic_library *dyn_lib) {
+    if (!dyn_lib) return;
+    if (dyn_lib->impl) {
+        CFRelease(dyn_lib->impl);
+    }
+    free(dyn_lib);
 }
 

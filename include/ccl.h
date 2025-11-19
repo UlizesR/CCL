@@ -46,8 +46,9 @@ typedef struct ccl_metal_capabilities {
     bool supports_simdgroup_matrix;  // SIMD-group matrix operations
     bool supports_indirect_command_buffers; // Indirect command buffers
     bool supports_argument_buffers;   // Argument buffers
+    bool supports_gpu_dynamic_libraries; // GPU Dynamic Libraries (Metal 4+)
     uint32_t max_function_table_size; // Max entries in function table
-    uint32_t max_argument_buffer_length; // Max argument buffer size
+    uint32_t max_argument_buffer_length; // Max argument buffer size (Metal 3: 128KB, Metal 4: potentially larger)
 } ccl_metal_capabilities;
 
 // Forward declarations
@@ -279,9 +280,13 @@ typedef struct ccl_function_table ccl_function_table;
 
 // Create a function table for GPU function pointer dispatch
 // size: Number of function entries in the table
+// initial_kernel: Optional kernel to use for creating the table's pipeline.
+//                 If NULL, the table will be created from the first kernel added via ccl_function_table_set.
+//                 All kernels added to the table must be compatible with the table's pipeline.
 ccl_error ccl_create_function_table(
     ccl_context *ctx,
     uint32_t size,
+    ccl_kernel *initial_kernel,  // Optional: if NULL, table created lazily on first set
     ccl_function_table **out_table
 );
 
@@ -395,6 +400,33 @@ ccl_error ccl_execute_indirect_command_buffer(
 
 // Destroy an indirect command buffer
 void ccl_destroy_indirect_command_buffer(ccl_indirect_command_buffer *icb);
+
+// GPU Dynamic Libraries (Metal 4+)
+// GPU Dynamic Libraries allow creating libraries that can be linked at runtime on the GPU
+typedef struct ccl_gpu_dynamic_library ccl_gpu_dynamic_library;
+
+// Create a GPU dynamic library from compiled library data
+// This is a Metal 4 feature that enables runtime library linking on the GPU
+ccl_error ccl_create_gpu_dynamic_library(
+    ccl_context *ctx,
+    const uint8_t *lib_data,
+    size_t lib_size,
+    ccl_gpu_dynamic_library **out_lib
+);
+
+// Create a kernel from a GPU dynamic library
+// This allows using functions from dynamically linked libraries
+ccl_error ccl_create_kernel_from_gpu_dynamic_library(
+    ccl_context *ctx,
+    ccl_gpu_dynamic_library *dyn_lib,
+    const char *entry_point,
+    ccl_kernel **out_kernel,
+    char *log_buffer,
+    size_t log_buffer_size
+);
+
+// Destroy a GPU dynamic library
+void ccl_destroy_gpu_dynamic_library(ccl_gpu_dynamic_library *dyn_lib);
 
 #ifdef __cplusplus
 }
