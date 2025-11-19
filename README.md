@@ -1,309 +1,408 @@
-# MTLComp - Production Metal Compute Library
+# CCL - Cross-Platform Compute Library
 
-A comprehensive, modular C API for Metal compute shaders with full Metal 3/4 feature support.
+CCL is a clean, portable C API for GPU compute that abstracts over multiple backends (Metal, OpenGL Compute, OpenCL). Currently, the Metal backend is fully implemented with comprehensive Metal 3/4 feature support.
 
-```
-╔════════════════════════════════════════════════════════════╗
-║                    MTLComp v2.0                            ║
-║        Complete Metal-for-Science Toolkit                  ║
-╚════════════════════════════════════════════════════════════╝
-```
+## Features
 
-## ✨ Features
+### Core Features
+- **Multi-dimensional dispatch**: 1D, 2D, and 3D compute grids
+- **Async execution**: Non-blocking dispatches with fence synchronization
+- **Pipeline caching**: Automatic kernel reuse for performance
+- **Uniform parameters**: Set small constants without creating buffers
+- **Buffer usage hints**: GPU-only buffers for optimal performance
+- **Debug labels**: Better GPU capture debugging in Xcode/Metal System Trace
+- **Thread-safe fences**: Query completion status without blocking
 
-### Core API (100% Complete)
-- ✅ **Device Management**: Multi-GPU, capability detection, Metal 3/4 runtime checks
-- ✅ **Pipeline System**: Source/file/metallib compilation, function constants, libraries
-- ✅ **Resources**: Buffers (shared/managed/private), textures (2D/3D/array), samplers, heaps
-- ✅ **4-Tier Dispatch**: Immediate, descriptor-based, encoder batching, async/profiled/indirect
+### Metal 3/4 Features
+- **Capability detection**: Runtime detection of Metal 3/4 features and GPU families
+- **Function tables**: GPU-side function pointer dispatch for dynamic kernel selection
+- **Binary archives**: Pipeline caching to disk for faster startup times
+- **Ray tracing**: Acceleration structures and ray tracing pipelines (Metal 3+)
+- **Indirect command buffers**: GPU-driven command generation for reduced CPU overhead
+- **SIMD-group matrix operations**: Optimized matrix operations on Apple7+ GPUs
+- **Argument buffers**: Enhanced resource binding with expanded limits (Metal 3/4)
 
-### Metal 3/4 Features (100% Complete)
-- ✅ **Argument Buffers**: Layout-aware resource binding for complex shaders
-- ✅ **Function Tables**: Dynamic GPU function dispatch (`MTLVisibleFunctionTable`)
-- ✅ **Indirect Command Buffers**: Pre-recorded GPU-driven execution
-- ✅ **Resource Reflection**: Automatic pipeline introspection & validation
-
-### High-Level Abstractions (100% Complete)
-- ✅ **Compute Passes**: Batch multiple dispatches into efficient frame-based workflows
-- ✅ **Standard Kernels**: 15+ optimized kernels (SAXPY, reductions, stencils, linear algebra)
-- ✅ **Auto Validation**: Pre-flight dispatch checking (debug mode)
-- ✅ **Debug Labels**: Xcode GPU debugger integration
-
-## 🚀 Quick Start
+## Quick Start
 
 ```c
-#include "mtl_compute_core.h"
+#include "ccl.h"
 
-// Create device
-MTLComputeDevice* device = mtl_compute_device_create();
+// Create context
+ccl_context *ctx;
+ccl_create_context(CCL_BACKEND_METAL, &ctx);
 
-// Compile shader
-MTLComputePipeline* pipeline = mtl_compute_pipeline_create(
-    device, "kernel void add(device float* a, device float* b) { a[0] += b[0]; }", 
-    "add", NULL, NULL, 0
-);
+// Create buffers
+ccl_buffer *input, *output;
+ccl_create_buffer(ctx, 1024 * sizeof(float), CCL_BUFFER_READ, data, &input);
+ccl_create_buffer(ctx, 1024 * sizeof(float), CCL_BUFFER_WRITE, NULL, &output);
 
-// Allocate buffers
-MTLComputeBuffer* buf_a = mtl_compute_buffer_create(device, 1024, MTL_STORAGE_SHARED);
-MTLComputeBuffer* buf_b = mtl_compute_buffer_create(device, 1024, MTL_STORAGE_SHARED);
+// Compile kernel
+const char *source = "kernel void add(device const float* a [[buffer(0)]], "
+                     "device float* b [[buffer(1)]], uint i [[thread_position_in_grid]]) {"
+                     "  b[i] = a[i] + 1.0f; }";
+ccl_kernel *kernel;
+char log[4096];
+ccl_create_kernel_from_source(ctx, source, "add", &kernel, log, sizeof(log));
 
 // Dispatch
-MTLComputeBuffer* buffers[] = {buf_a, buf_b};
-mtl_compute_dispatch_sync(device, pipeline, buffers, 2, 256, 1, 1, 256, 1, 1);
+ccl_buffer *buffers[2] = {input, output};
+ccl_dispatch_1d(ctx, kernel, 1024, 0, buffers, 2);
 
-// Read results
-float* result = mtl_compute_buffer_contents(buf_a);
+// Download results
+float results[1024];
+ccl_buffer_download(output, 0, results, sizeof(results));
 
 // Cleanup
-mtl_compute_buffer_destroy(buf_a);
-mtl_compute_buffer_destroy(buf_b);
-mtl_compute_pipeline_destroy(pipeline);
-mtl_compute_device_destroy(device);
+ccl_destroy_kernel(kernel);
+ccl_destroy_buffer(input);
+ccl_destroy_buffer(output);
+ccl_destroy_context(ctx);
 ```
 
-## 📦 Building
+## API Overview
+
+### Context Management
+
+```c
+ccl_error ccl_create_context(ccl_backend backend, ccl_context **out_ctx);
+void ccl_destroy_context(ccl_context *ctx);
+```
+
+**Thread Safety**: Contexts are not thread-safe. Use each context from a single thread. Multiple contexts can be used concurrently from different threads.
+
+### Buffers
+
+```c
+// Standard buffer creation (shared CPU/GPU memory)
+ccl_error ccl_create_buffer(
+    ccl_context *ctx,
+    size_t size,
+    ccl_buffer_flags flags,
+    const void *initial_data,
+    ccl_buffer **out_buf
+);
+
+// Extended creation with usage hints
+ccl_error ccl_create_buffer_ex(
+    ccl_context *ctx,
+    size_t size,
+    ccl_buffer_flags flags,
+    ccl_buffer_usage usage,  // GPU_ONLY, CPU_TO_GPU, etc.
+    const void *initial_data,
+    ccl_buffer **out_buf
+);
+
+ccl_error ccl_buffer_upload(ccl_buffer *buf, size_t offset, const void *data, size_t size);
+ccl_error ccl_buffer_download(ccl_buffer *buf, size_t offset, void *data, size_t size);
+```
+
+**Buffer Usage Hints**:
+- `CCL_BUFFER_USAGE_DEFAULT`: Shared memory (CPU/GPU accessible)
+- `CCL_BUFFER_USAGE_GPU_ONLY`: Private memory (GPU-only, faster)
+- `CCL_BUFFER_USAGE_CPU_TO_GPU`: Optimized for CPU→GPU transfers
+- `CCL_BUFFER_USAGE_GPU_TO_CPU`: Optimized for GPU→CPU transfers
+
+**Note**: GPU_ONLY buffers currently don't support `ccl_buffer_upload`/`ccl_buffer_download` after creation. Use initial data at creation time.
+
+### Kernels
+
+```c
+// Compile from source
+ccl_error ccl_create_kernel_from_source(
+    ccl_context *ctx,
+    const char *source,
+    const char *entry_point,
+    ccl_kernel **out_kernel,
+    char *log_buffer,        // optional, receives compile errors
+    size_t log_buffer_size
+);
+
+// Create from precompiled library (faster startup, better obfuscation)
+ccl_error ccl_create_kernel_from_library(
+    ccl_context *ctx,
+    const uint8_t *lib_data,
+    size_t lib_size,
+    const char *entry_point,
+    ccl_kernel **out_kernel,
+    char *log_buffer,
+    size_t log_buffer_size
+);
+
+// Set uniform/constant parameters (persist across dispatches)
+ccl_error ccl_set_bytes(ccl_kernel *kernel, uint32_t index, const void *data, size_t size);
+void ccl_clear_bytes(ccl_kernel *kernel);  // Clear all uniforms
+```
+
+**Uniforms**: Uniforms set via `ccl_set_bytes` persist across all dispatches of that kernel until explicitly cleared. This is useful for setting small constants (scalars, structs) without creating buffers.
+
+**Important**: Uniforms and buffers share the same index space. If you set a uniform at index N and also pass a buffer at index N, the buffer will override the uniform. Avoid reusing indices between uniforms and buffers.
+
+### Dispatch
+
+```c
+// N-dimensional dispatch (1D, 2D, or 3D)
+ccl_error ccl_dispatch_nd(
+    ccl_context *ctx,
+    ccl_kernel *kernel,
+    size_t dim,                    // 1, 2, or 3
+    const size_t global_size[3],   // [x, y, z] dimensions
+    const size_t local_size[3],    // threadgroup size (0 = auto)
+    ccl_buffer **buffers,
+    size_t num_buffers
+);
+
+// Async version (non-blocking)
+ccl_error ccl_dispatch_nd_async(
+    ccl_context *ctx,
+    ccl_kernel *kernel,
+    size_t dim,
+    const size_t global_size[3],
+    const size_t local_size[3],
+    ccl_buffer **buffers,
+    size_t num_buffers,
+    ccl_fence **out_fence   // optional, NULL for fire-and-forget
+);
+
+// Convenience wrappers for 1D
+ccl_error ccl_dispatch_1d(...);
+ccl_error ccl_dispatch_1d_async(...);
+```
+
+**Threadgroup Sizing**: If `local_size` is 0, CCL automatically selects optimal threadgroup sizes based on hardware capabilities (e.g., `threadExecutionWidth` on Metal).
+
+### Fences
+
+```c
+bool ccl_fence_is_complete(ccl_fence *fence);  // Non-blocking check
+void ccl_fence_wait(ccl_fence *fence);         // Blocking wait
+void ccl_fence_destroy(ccl_fence *fence);
+```
+
+### Debug Labels
+
+```c
+void ccl_set_context_label(ccl_context *ctx, const char *label);
+void ccl_set_buffer_label(ccl_buffer *buf, const char *label);
+void ccl_set_kernel_label(ccl_kernel *kernel, const char *label);
+```
+
+Labels improve readability in GPU capture tools (Xcode, Metal System Trace).
+
+### Log Callback
+
+```c
+typedef void (*ccl_log_fn)(const char *msg, void *user_data);
+
+void ccl_set_log_callback(ccl_context *ctx, ccl_log_fn fn, void *user_data);
+```
+
+Set a callback to receive runtime error messages (compile failures, dispatch errors). Useful for integrating with GUI logs or custom error handling.
+
+### Device Information
+
+```c
+typedef enum ccl_device_info {
+    CCL_DEVICE_INFO_NAME,                    // Device name (string)
+    CCL_DEVICE_INFO_MAX_THREADS_PER_THREADGROUP, // Max threads (uint64_t)
+    CCL_DEVICE_INFO_THREAD_EXECUTION_WIDTH,  // SIMD width (uint64_t)
+    CCL_DEVICE_INFO_MAX_BUFFER_LENGTH,       // Max buffer size (uint64_t)
+    CCL_DEVICE_INFO_SUPPORTS_GPU_ONLY_BUFFERS, // Private storage support (bool)
+    CCL_DEVICE_INFO_MAX_COMPUTE_UNITS        // Compute units (uint64_t)
+} ccl_device_info;
+
+ccl_error ccl_get_device_info(
+    ccl_context *ctx,
+    ccl_device_info info,
+    void *out_value,      // Pointer to output (type depends on info)
+    size_t *out_size      // In: size of buffer, Out: actual size needed
+);
+```
+
+Query device capabilities and properties. Useful for choosing optimal problem sizes and threadgroup configurations.
+
+**Example:**
+```c
+char deviceName[256];
+size_t size = sizeof(deviceName);
+ccl_get_device_info(ctx, CCL_DEVICE_INFO_NAME, deviceName, &size);
+printf("Device: %s\n", deviceName);
+
+uint64_t maxThreads;
+size = sizeof(maxThreads);
+ccl_get_device_info(ctx, CCL_DEVICE_INFO_MAX_THREADS_PER_THREADGROUP, 
+                   &maxThreads, &size);
+```
+
+**Note**: Some properties (like max threads per threadgroup) are per-pipeline in Metal, so the values returned are reasonable defaults. Actual values may vary based on the specific kernel.
+
+### Metal Capabilities
+
+Query Metal-specific capabilities and feature support:
+
+```c
+ccl_metal_capabilities caps;
+ccl_get_metal_capabilities(ctx, &caps);
+
+if (caps.supports_metal_4) {
+    printf("Metal 4 supported!\n");
+}
+if (caps.supports_function_tables) {
+    printf("Function tables available (max size: %u)\n", caps.max_function_table_size);
+}
+if (caps.supports_raytracing) {
+    printf("Ray tracing supported\n");
+}
+if (caps.supports_simdgroup_matrix) {
+    printf("SIMD-group matrix operations available\n");
+}
+```
+
+### Function Tables (Metal 3+)
+
+Function tables enable GPU-side function pointer dispatch:
+
+```c
+// Create a function table
+ccl_function_table *table;
+ccl_create_function_table(ctx, 16, &table);  // 16 function slots
+
+// Add kernels to the table
+ccl_function_table_set(table, kernel1, 0);
+ccl_function_table_set(table, kernel2, 1);
+
+// Use the table in your shader (via buffer binding)
+// The shader can dynamically select which function to call
+
+ccl_destroy_function_table(table);
+```
+
+### Binary Archives (Metal 3+)
+
+Cache compiled pipelines to disk for faster startup:
+
+```c
+// Create archive and add kernels
+ccl_binary_archive *archive;
+ccl_create_binary_archive(ctx, &archive);
+ccl_binary_archive_add_kernel(archive, kernel1);
+ccl_binary_archive_add_kernel(archive, kernel2);
+
+// Serialize to save
+uint8_t *data = malloc(1024 * 1024);
+size_t size = 1024 * 1024;
+ccl_binary_archive_serialize(archive, data, &size);
+// Save data to disk...
+
+ccl_destroy_binary_archive(archive);
+```
+
+### Ray Tracing (Metal 3+)
+
+Create acceleration structures and ray tracing pipelines:
+
+```c
+// Create acceleration structure
+ccl_acceleration_structure *as;
+ccl_create_acceleration_structure(ctx, geometry_count, &as);
+
+// Create ray tracing pipeline
+ccl_raytracing_pipeline *rt_pipeline;
+const char *source = "...";  // Ray tracing shader source
+ccl_create_raytracing_pipeline_from_source(
+    ctx, source, "raygen_function", "intersection_function",
+    &rt_pipeline, log, sizeof(log)
+);
+
+ccl_destroy_raytracing_pipeline(rt_pipeline);
+ccl_destroy_acceleration_structure(as);
+```
+
+### Indirect Command Buffers (Metal 3+)
+
+Reduce CPU overhead with GPU-driven command generation:
+
+```c
+// Create ICB
+ccl_indirect_command_buffer *icb;
+ccl_create_indirect_command_buffer(ctx, 100, &icb);  // Max 100 commands
+
+// Encode commands into ICB
+ccl_indirect_command_buffer_encode_compute(
+    icb, kernel, 1, global_size, local_size, buffers, num_buffers
+);
+
+// Execute ICB
+ccl_fence *fence;
+ccl_execute_indirect_command_buffer(ctx, icb, 1, &fence);
+ccl_fence_wait(fence);
+
+ccl_destroy_indirect_command_buffer(icb);
+```
+
+## Examples
+
+### Basic Vector Addition
+
+See `examples/vec_add_metal.c` for a simple example.
+
+### Advanced Matrix Multiplication
+
+See `examples/matrix_mult_metal.c` for a comprehensive example demonstrating:
+- 2D dispatch
+- Uniforms API
+- Async dispatch with fences
+- Pipeline caching
+- Multiple concurrent dispatches
+
+### Device Information
+
+See `examples/device_info_metal.c` for an example of querying device capabilities.
+
+### SIMD-Group Matrix Operations
+
+See `shaders/simdgroup_matrix.metal` for example kernels demonstrating SIMD-group matrix operations (Metal 3+, Apple7+ GPUs).
+
+## Building
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
 
 ### Requirements
-- macOS 10.15+ (Catalina or later)
-- Xcode Command Line Tools
+
+- macOS with Metal support
 - CMake 3.15+
+- Xcode Command Line Tools
 
-### Build Commands
-```bash
-cmake -B build
-cmake --build build
+## Error Handling
 
-# Install system-wide (optional)
-sudo cmake --install build
-```
+All functions return `ccl_error`:
+- `CCL_OK`: Success
+- `CCL_ERROR_INVALID_ARGUMENT`: Invalid parameters
+- `CCL_ERROR_DEVICE_FAILED`: GPU/device error
+- `CCL_ERROR_COMPILE_FAILED`: Kernel compilation failed (check log_buffer)
+- `CCL_ERROR_DISPATCH_FAILED`: Dispatch execution failed
+- `CCL_ERROR_UNSUPPORTED_BACKEND`: Backend not available
 
-### Build Output
-- **Library**: `build/libmtlcompute.a` (88KB)
-- **Examples**: `build/bin/example_*`
-- **Headers**: `src/mtl_compute_core.h`, `src/mtl_compute.h`, `src/mtl_texture.h`
+## Performance Tips
 
-## 📚 Examples
+1. **Use GPU_ONLY buffers** for data that never needs CPU access
+2. **Reuse kernels** - pipeline caching automatically reuses compiled kernels
+3. **Use async dispatch** when launching multiple kernels
+4. **Set uniforms** instead of creating tiny buffers for constants
+5. **Use 2D/3D dispatch** for naturally multi-dimensional problems
+6. **Precompile libraries** - use `ccl_create_kernel_from_library` for faster startup and better code obfuscation
+7. **Use binary archives** (Metal 3+) to cache pipelines to disk and reduce compilation time
+8. **Leverage function tables** (Metal 3+) for dynamic kernel selection without CPU overhead
+9. **Use indirect command buffers** (Metal 3+) for GPU-driven pipelines with many similar dispatches
+10. **Check capabilities** - use `ccl_get_metal_capabilities` to gate Metal 3/4 features appropriately
 
-### 1. Image Processing (`example_image_effects`)
-Real-world GPU image filters:
-```bash
-./build/bin/example_image_effects
-```
-**Output**: 9 processed images (blur, sharpen, edges, grayscale, sepia, etc.)
+## Thread Safety
 
-### 2. Feature Test (`example_feature_test`)
-Comprehensive API coverage test:
-```bash
-./build/bin/example_feature_test
-```
-**Tests**: Basic dispatch, async execution, profiling, auto-threadgroups
+- **Contexts**: Not thread-safe. Use from a single thread.
+- **Buffers/Kernels**: Can be used from any thread, but must outlive all dispatches.
+- **Fences**: Can be checked/wait from any thread.
 
-### 3. Scientific Computing (`example_standard_kernels`)
-Pre-built kernel library demo:
-```bash
-./build/bin/example_standard_kernels
-```
-**Demonstrations**: SAXPY, reductions, compute passes, 2D heat equation
 
-## 🧩 Architecture
-
-```
-MTLComp/
-├── src/
-│   ├── mtl_compute_core.h      [Umbrella header - include this]
-│   ├── mtl_compute.h           [Complete API - 1200+ lines]
-│   ├── mtl_texture.h           [Texture extensions]
-│   ├── mtl_internal.h          [Internal definitions]
-│   │
-│   ├── mtl_logging.m           [Centralized logging]
-│   ├── mtl_device.m            [Device & capabilities]
-│   ├── mtl_pipeline.m          [Compilation & reflection]
-│   ├── mtl_resource.m          [Buffers, samplers, heaps]
-│   ├── mtl_dispatch.m          [Core dispatch (T1-3)]
-│   ├── mtl_dispatch_advanced.m [Advanced dispatch (T4)]
-│   ├── mtl_argbuf.m            [Argument buffers, function tables, ICBs]
-│   ├── mtl_pass.m              [Compute passes]
-│   └── mtl_texture.m           [Texture operations]
-│
-├── shaders/
-│   ├── image_effects.metal     [9 image processing kernels]
-│   ├── standard_kernels.metal  [15 scientific computing kernels]
-│   └── advanced_compute.metal  [Advanced examples]
-│
-└── examples/
-    ├── example_image_effects.c       [Real-world image processing]
-    ├── example_feature_test.c        [API test suite]
-    └── example_standard_kernels.c    [Scientific kernels demo]
-```
-
-## 🎯 Use Cases
-
-### Scientific Computing
-- **PDE Solvers**: Heat equation, diffusion, wave propagation
-- **Linear Algebra**: Matrix operations, dot products, SAXPY
-- **Reductions**: Sum, min/max, statistics
-- **Signal Processing**: Convolution, FFT, filtering
-
-### Graphics & Media
-- **Image Processing**: Filters, effects, color correction
-- **Video Processing**: Frame-by-frame GPU acceleration
-- **Texture Generation**: Procedural textures, noise
-
-### Machine Learning
-- **Inference**: Custom layer implementations
-- **Data Preprocessing**: Normalization, augmentation
-- **Loss Computation**: Custom differentiable ops
-
-### Simulation
-- **Physics**: N-body, fluid dynamics, molecular dynamics
-- **Ray Tracing**: Via function tables + ICBs
-- **Agent-Based Models**: Parallel agent updates
-
-## 📖 Standard Kernel Library
-
-Pre-built kernels in `shaders/standard_kernels.metal`:
-
-### Basic Operations
-- `fill_float`, `copy_float`, `saxpy`, `multiply_arrays`
-
-### Reductions
-- `reduce_sum_threadgroup`, `reduce_min`, `dot_product_partial`
-
-### Scientific Computing
-- `heat_2d_step` (5-point stencil)
-- `diffusion_3d_step` (7-point stencil)
-
-### Linear Algebra
-- `matvec_multiply` (matrix-vector product)
-
-### Signal Processing
-- `convolve_1d`, `prefix_sum` (scan)
-
-### Utilities
-- `generate_test_data`, `validate_results`
-
-## 🔬 Advanced Features
-
-### Argument Buffers
-Bind 100+ resources to a single kernel:
-```c
-MTLComputeArgDesc layout[] = {
-    {MTL_ARG_BUFFER, 0}, {MTL_ARG_TEXTURE, 1}, {MTL_ARG_SAMPLER, 2}
-};
-MTLComputeArgumentBuffer* argbuf = mtl_compute_argbuf_create_layout(device, layout, 3);
-mtl_compute_argbuf_set_buffer(argbuf, 0, my_buffer);
-mtl_compute_argbuf_set_texture(argbuf, 1, my_texture);
-mtl_compute_argbuf_set_sampler(argbuf, 2, my_sampler);
-```
-
-### Function Tables
-Dynamic GPU function dispatch:
-```c
-MTLComputeFunctionTable* table = mtl_compute_function_table_create(device, pipeline, 10);
-mtl_compute_function_table_set(table, 0, function_pipeline);
-// Use in shader: device_function_table[index](args);
-```
-
-### Indirect Command Buffers
-Pre-record GPU commands:
-```c
-MTLComputeIndirectCommandBuffer* icb = mtl_compute_icb_create(device, pipeline, 100);
-mtl_compute_icb_encode_dispatch(icb, 0, threadgroups_x, threadgroups_y, threadgroups_z);
-mtl_compute_icb_execute(device, icb);
-```
-
-### Compute Passes
-Batch multiple dispatches:
-```c
-MTLComputePass* pass = mtl_compute_pass_create(device, 10);
-mtl_compute_pass_add_dispatch(pass, &descriptor1);
-mtl_compute_pass_add_dispatch(pass, &descriptor2);
-mtl_compute_pass_execute(pass);  // Submit all at once
-```
-
-## 🛠️ API Tiers
-
-### Tier 1: Immediate Dispatch
-```c
-mtl_compute_dispatch_1d(device, pipeline, buffers, 2, width, threads_per_group);
-```
-
-### Tier 2: Descriptor-Based
-```c
-MTLComputeDispatchDesc desc = { .pipeline = pipeline, .buffers = buffers, ... };
-mtl_compute_dispatch_desc(device, &desc);
-```
-
-### Tier 3: Encoder Batching
-```c
-MTLComputeCommandList* cmd;
-mtl_compute_begin(device, &cmd);
-mtl_compute_encode_dispatch(cmd, &desc1);
-mtl_compute_encode_dispatch(cmd, &desc2);
-mtl_compute_end_submit(cmd);
-```
-
-### Tier 4: Advanced Execution
-```c
-// Async with shared event
-mtl_compute_dispatch_async(device, pipeline, buffers, 2, ..., shared_event, signal_value);
-
-// Profiled with GPU timing
-MTLComputePerformanceStats stats;
-mtl_compute_dispatch_profiled(device, pipeline, buffers, 2, ..., &stats);
-
-// Indirect dispatch from GPU buffer
-mtl_compute_dispatch_indirect(device, pipeline, buffers, 2, ..., indirect_buffer, offset);
-```
-
-## 📊 Statistics
-
-- **9 implementation modules** (~3,200 lines)
-- **4 public headers** (~1,500 lines of docs)
-- **15+ standard kernels** (scientific computing)
-- **3 comprehensive examples**
-- **88KB static library**
-- **100% Metal 3/4 coverage**
-
-## 🎓 Documentation
-
-- `IMPLEMENTATION_COMPLETE.md` - Detailed completion report
-- `src/mtl_compute.h` - Comprehensive API documentation
-- `examples/*.c` - Working code examples
-- `shaders/*.metal` - Annotated kernel implementations
-
-## 🏆 Implementation Status
-
-| Feature | Status |
-|---------|--------|
-| Core Dispatch | ✅ 100% |
-| Metal 3/4 Features | ✅ 100% |
-| Texture Support | ✅ 100% |
-| Resource Reflection | ✅ 100% |
-| Validation | ✅ 100% |
-| Compute Passes | ✅ 100% |
-| Standard Kernels | ✅ 100% |
-| Examples | ✅ 100% |
-
-**Overall: Production-Ready** 🚀
-
-## 🤝 Contributing
-
-This is a complete, stable implementation. Future enhancements could include:
-- Binary archive caching
-- Metal Performance Shaders integration
-- Ray tracing API
-- Python bindings
-- Performance profiler UI
-
-## 📄 License
-
-[Your License Here]
-
-## 🙏 Acknowledgments
-
-Built with Metal 3/4 specification compliance, following Apple's best practices for high-performance GPU computing.
-
----
-
-**MTLComp** - Your complete Metal-for-science toolkit 🎉
